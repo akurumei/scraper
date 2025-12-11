@@ -15,93 +15,115 @@ async def scrape_account(page, username):
     print(f"\n📱 Checking {username}...")
     print(f"   URL: {url}")
     
-    await page.goto(url, wait_until='networkidle')
+    # Navigate and wait for network to be idle
+    await page.goto(url, wait_until='networkidle', timeout=30000)
     
-    # Wait longer for dynamic content
-    await page.wait_for_timeout(5000)
+    # Wait extra time for JavaScript to execute
+    print("   ⏳ Waiting for dynamic content...")
+    await page.wait_for_timeout(8000)
     
-    # Debug: Get page title
-    title = await page.title()
-    print(f"   Page title: {title}")
+    # Try clicking on "Stories" tab if it exists
+    try:
+        stories_tab = page.locator('text=Stories').first
+        if await stories_tab.is_visible():
+            await stories_tab.click()
+            await page.wait_for_timeout(2000)
+            print("   ✓ Clicked Stories tab")
+    except:
+        print("   ℹ️  Stories tab not found or already active")
     
-    # Debug: Check what's on the page
-    page_text = await page.content()
-    has_no_stories_text = 'No new stories' in page_text
-    print(f"   'No new stories' text found: {has_no_stories_text}")
+    # Get page content
+    page_content = await page.content()
     
-    if has_no_stories_text:
-        print(f"  ❌ No stories available")
-        return []
+    # Check for "No new stories" text
+    has_no_stories = 'No new stories' in page_content
+    print(f"   'No new stories' found: {has_no_stories}")
     
-    # Try multiple strategies to find stories
+    # Check what's actually visible
+    all_images = await page.locator('img').all()
+    print(f"   Total images on page: {len(all_images)}")
+    
     stories = []
     
-    # Strategy 1: Look for all images on page
-    all_images = await page.locator('img').all()
-    print(f"   Total images found: {len(all_images)}")
-    
+    # Look through all images
     for idx, img in enumerate(all_images):
         try:
             src = await img.get_attribute('src')
             if not src:
                 continue
+            
+            # Check if it's likely a story image
+            is_cdn = any(domain in src for domain in [
+                'cdn.insta-stories-viewer.com',
+                'cdninstagram',
+                'fbcdn.net',
+                'scontent'
+            ])
+            
+            if is_cdn:
+                # Check if element is visible
+                is_visible = await img.is_visible()
+                if not is_visible:
+                    continue
                 
-            # Check if it's a CDN image (likely a story)
-            if 'cdn.insta-stories-viewer.com' in src or 'cdninstagram' in src or 'fbcdn' in src:
-                # Get dimensions to filter out tiny images
+                # Get bounding box
                 box = await img.bounding_box()
-                
                 if box:
                     width = box['width']
                     height = box['height']
-                    print(f"   Image {idx}: {width}x{height}px - {src[:100]}")
                     
-                    # Skip small images (profile pics, icons)
-                    if width < 100 or height < 100:
-                        print(f"     ⏭ Too small")
-                        continue
-                    
-                    stories.append({
-                        'type': 'image',
-                        'url': src,
-                        'index': len(stories)
-                    })
-                    print(f"     ✅ Added!")
-                    
+                    # Filter small images
+                    if width >= 100 and height >= 100:
+                        print(f"   📷 Image {len(stories)}: {int(width)}x{int(height)}px")
+                        print(f"      URL: {src[:80]}...")
+                        
+                        stories.append({
+                            'type': 'image',
+                            'url': src,
+                            'index': len(stories)
+                        })
         except Exception as e:
-            print(f"   ⚠ Error with image {idx}: {e}")
+            pass
     
-    # Strategy 2: Look for videos
+    # Look for videos
     videos = await page.locator('video').all()
-    print(f"   Total videos found: {len(videos)}")
+    print(f"   Total videos on page: {len(videos)}")
     
-    for idx, video in enumerate(videos):
+    for video in videos:
         try:
             src = await video.get_attribute('src')
-            poster = await video.get_attribute('poster')
-            
-            if src:
-                print(f"   Video {idx}: {src[:100]}")
+            if src and await video.is_visible():
+                print(f"   🎥 Video: {src[:80]}...")
                 stories.append({
                     'type': 'video',
                     'url': src,
                     'index': len(stories)
                 })
-                print(f"     ✅ Added!")
-                
-        except Exception as e:
-            print(f"   ⚠ Error with video {idx}: {e}")
+        except:
+            pass
     
-    # Strategy 3: Look for specific story containers
-    story_containers = await page.locator('[class*="story"], [class*="Story"]').all()
-    print(f"   Story containers found: {len(story_containers)}")
+    if not stories and not has_no_stories:
+        # If we didn't find stories but also didn't see "no stories", page might not have loaded
+        print(f"   ⚠️  Page may not have loaded correctly")
+        print(f"   📄 Saving page HTML for debugging...")
+        
+        # Save HTML for inspection
+        debug_dir = os.path.join(DOWNLOAD_DIR, 'debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_file = os.path.join(debug_dir, f'{username}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.html')
+        with open(debug_file, 'w', encoding='utf-8') as f:
+            f.write(page_content)
+        print(f"   💾 Saved to: {debug_file}")
+        
+        # Take a screenshot
+        screenshot_file = debug_file.replace('.html', '.png')
+        await page.screenshot(path=screenshot_file, full_page=True)
+        print(f"   📸 Screenshot: {screenshot_file}")
     
     if stories:
-        print(f"  ✅ Found {len(stories)} stories total")
+        print(f"  ✅ Found {len(stories)} stories")
     else:
-        print(f"  ❌ No story media found")
-        print(f"  🔍 Page HTML preview (first 500 chars):")
-        print(f"     {page_text[:500]}")
+        print(f"  ❌ No stories found")
     
     return stories
 
@@ -111,31 +133,27 @@ async def download_media(page, media_item, username, existing_hashes):
     media_type = media_item['type']
     
     try:
-        print(f"   📥 Downloading: {url[:80]}...")
+        print(f"   📥 Downloading...")
         
-        # Fetch the media
         response = await page.request.get(url)
         content = await response.body()
         
-        # Check if we already have this file (by hash)
         content_hash = hashlib.md5(content).hexdigest()
         
         if content_hash in existing_hashes:
-            print(f"      ⏭ Skipped duplicate")
+            print(f"      ⏭ Duplicate")
             return None
         
-        # Create filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         ext = 'mp4' if media_type == 'video' else 'jpg'
         filename = f"{username}_{timestamp}_{content_hash[:8]}.{ext}"
         filepath = os.path.join(DOWNLOAD_DIR, username, filename)
         
-        # Save file
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, 'wb') as f:
             f.write(content)
         
-        print(f"      ✅ Saved: {filename} ({len(content)//1024}KB)")
+        print(f"      ✅ {filename} ({len(content)//1024}KB)")
         
         existing_hashes.add(content_hash)
         
@@ -147,22 +165,21 @@ async def download_media(page, media_item, username, existing_hashes):
         }
         
     except Exception as e:
-        print(f"      ❌ Failed: {e}")
+        print(f"      ❌ Error: {e}")
         return None
 
 def load_existing_hashes(username):
-    """Load hashes of previously downloaded files to avoid duplicates"""
+    """Load hashes of previously downloaded files"""
     hashes = set()
     user_dir = os.path.join(DOWNLOAD_DIR, username)
     
     if os.path.exists(user_dir):
         for filename in os.listdir(user_dir):
             filepath = os.path.join(user_dir, filename)
-            if os.path.isfile(filepath):
+            if os.path.isfile(filepath) and not filename.endswith('.html'):
                 try:
                     with open(filepath, 'rb') as f:
-                        content = f.read()
-                        hashes.add(hashlib.md5(content).hexdigest())
+                        hashes.add(hashlib.md5(f.read()).hexdigest())
                 except:
                     pass
     
@@ -172,17 +189,43 @@ async def main():
     """Main scraping function"""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     
-    print("🚀 Starting Instagram Stories Scraper")
-    print(f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("🚀 Instagram Stories Scraper")
+    print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📋 Accounts: {', '.join(ACCOUNTS)}")
     
     async with async_playwright() as p:
-        print("\n🌐 Launching browser...")
-        browser = await p.chromium.launch(headless=True)
+        print("\n🌐 Launching browser with stealth mode...")
+        
+        # Launch with more realistic settings
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox'
+            ]
+        )
+        
         context = await browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='en-US',
+            timezone_id='America/New_York'
         )
+        
+        # Add stealth scripts
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+        """)
+        
         page = await context.new_page()
         
         all_downloads = []
@@ -190,12 +233,12 @@ async def main():
         for username in ACCOUNTS:
             existing_hashes = load_existing_hashes(username)
             if existing_hashes:
-                print(f"  📁 Already have {len(existing_hashes)} files")
+                print(f"  📁 {len(existing_hashes)} existing files")
             
             stories = await scrape_account(page, username)
             
             if stories:
-                print(f"\n  📥 Downloading {len(stories)} stories...")
+                print(f"\n  📥 Downloading {len(stories)} items...")
                 for story in stories:
                     result = await download_media(page, story, username, existing_hashes)
                     if result:
@@ -208,21 +251,20 @@ async def main():
                         })
                     await asyncio.sleep(1)
             
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
         
         await browser.close()
         
-        # Save manifest
         if all_downloads:
-            manifest_path = os.path.join(DOWNLOAD_DIR, f'manifest_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-            with open(manifest_path, 'w') as f:
+            manifest = os.path.join(DOWNLOAD_DIR, f'manifest_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+            with open(manifest, 'w') as f:
                 json.dump(all_downloads, f, indent=2)
-            print(f"\n📄 Manifest: {manifest_path}")
+            print(f"\n📄 Manifest: {manifest}")
         
         print(f"\n{'='*60}")
-        print(f"✅ COMPLETE! Downloaded {len(all_downloads)} new files")
-        if len(all_downloads) == 0:
-            print("   ℹ️  No new stories found this run")
+        print(f"✅ DONE! Downloaded {len(all_downloads)} files")
+        if not all_downloads:
+            print("   ℹ️  Check debug/ folder for HTML/screenshots")
         print(f"{'='*60}")
 
 if __name__ == '__main__':
